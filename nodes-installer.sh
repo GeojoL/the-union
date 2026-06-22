@@ -48,6 +48,28 @@ created=$(date '+%Y-%m-%dT%H:%M:%S')
 role=machine-nodes 节点级人格(随机命名);职责=本机节点 agent + 与 center 读确认握手
 EOF
 
+# 3b) 装【通讯身份·防冒充】toolkit(Mahaul@macjol 实战 + najol B+ 标准;全节点同律)
+#     原理:ccp-send/ccp-pull 未设 CCP_ID 时,按当前 tmux 窗口名派生身份 capitalize(窗名)@<节点名>,
+#     再对本机 roster 校验;拿不到窗名/不在名单 → fail-loud 拒发,绝不回退默认身份冒充别人。
+say "装通讯身份防冒充 toolkit(ccp-resolve-id + ~/.ccp-node + roster)"
+if [ -f "$SRC_DIR/node/ccp-resolve-id" ]; then cp "$SRC_DIR/node/ccp-resolve-id" "$BIN/ccp-resolve-id"
+else curl -fsSL "$RAW/node/ccp-resolve-id" -o "$BIN/ccp-resolve-id"; fi
+chmod +x "$BIN/ccp-resolve-id"
+printf '%s\n' "$NODE" > "$HOME/.ccp-node"          # 节点名(不裸 hostname:本机 hostname 可能≠节点名)
+mkdir -p "$HOME/.ccp-inbox"
+if [ ! -f "$HOME/.ccp-inbox/roster" ]; then
+  cat > "$HOME/.ccp-inbox/roster" <<RO
+# 本机通讯参与者名单(防冒充校验源)。每行一个完整身份 = Capitalize(tmux窗口名)@$NODE
+# ccp-send/ccp-pull 未设 CCP_ID 时按当前 tmux 窗口名派生身份,必须在本名单内才放行(否则 fail-loud 拒发)。
+# 正式 AI 身份权威在根 AI-PROTOCOL §1(变动报根);本机 dev persona 留本地即可。
+# 例(按你的窗口名填,删本注释行):
+# $PERSONA@$NODE
+RO
+  say "已建 roster 脚手架 ~/.ccp-inbox/roster(请按本机窗口名填入参与者身份)"
+fi
+# ⚠ caveat:把 ccp-send/ccp-pull 默认改 fail-loud 后,【非 tmux 且没设 CCP_ID 的 launchd/cron 调用者会被拒】。
+#   本机若有此类自动调用者(如投递门铃内部 ccp-pull),务必在其 plist/unit 环境里显式设 CCP_ID,否则通讯故障。
+
 # 4) 起 node-agent 服务(systemd / launchd / nohup)
 OS="$(uname -s)"; PY="$(command -v python3)"
 start_systemd(){

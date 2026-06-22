@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# ccp-resolve-id — 解析当前 CCP 身份(B+ 标准,najol 定/Mahaul 实现 macjol 侧;DRY 单点,供 ccp-send/ccp-pull/... 复用)。
+# 规则:① $CCP_ID 已设 → 直接用(显式优先)。
+#   ② 未设 → 从 tmux 窗口名派生:capitalize(window_name)+'@'+<节点名>。
+#      节点名取 ~/.ccp-node(各机一份,如 macjol);无则回退 hostname -s。★不写死 @macjol,generic 跨机同律。
+#   ③ 派生后【对 roster 校验】(~/.ccp-inbox/roster,本机 known-AI 名单,镜像 AI-PROTOCOL §1)——不在名单→拒。
+#   ④ 拿不到窗口名(无 TMUX_PANE/不在 tmux/名空)或无 roster → 【fail-loud 拒发,exit 非0,绝不回退硬编码身份】=杀冒充核心。
+set -uo pipefail
+if [ -n "${CCP_ID:-}" ]; then printf '%s\n' "$CCP_ID"; exit 0; fi
+TMUX_BIN="$(command -v tmux || echo /opt/homebrew/bin/tmux)"
+if [ -z "${TMUX_PANE:-}" ]; then
+  echo "ccp-resolve-id: CCP_ID 未设且不在 tmux pane(无 TMUX_PANE)→ 拒绝解析(fail-loud,防默认冒充)。请显式 export CCP_ID=<你的身份>。" >&2; exit 3
+fi
+wn="$("$TMUX_BIN" display-message -p -t "$TMUX_PANE" '#{window_name}' 2>/dev/null || true)"
+[ -n "$wn" ] || { echo "ccp-resolve-id: 取不到 tmux 窗口名 → 拒绝(fail-loud)。" >&2; exit 3; }
+first="$(printf '%s' "$wn" | cut -c1 | tr '[:lower:]' '[:upper:]')"
+rest="$(printf '%s' "$wn" | cut -c2-)"
+node="$(tr -d '[:space:]' < "$HOME/.ccp-node" 2>/dev/null || true)"; [ -n "$node" ] || node="$(hostname -s)"
+id="${first}${rest}@${node}"
+roster="$HOME/.ccp-inbox/roster"
+if [ ! -f "$roster" ]; then
+  echo "ccp-resolve-id: 无 roster 名单 $roster,无法校验派生身份 '$id' → 拒绝(fail-loud)。" >&2; exit 4
+fi
+if ! grep -qx "$id" "$roster"; then
+  echo "ccp-resolve-id: 派生身份 '$id' 不在 roster 名单($roster)→ 拒绝(防 typo/未改名窗口冒充)。" >&2; exit 4
+fi
+printf '%s\n' "$id"
