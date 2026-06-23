@@ -57,3 +57,25 @@ machine-nodes 的健康验证**不看心跳**，看**读确认挑战-应答**：
 | `HS_INTERVAL` | 60 | 回合间隔（秒）|
 | `HS_DURATION` | 43200 | 总时长（秒，12h）|
 | `CENTER` | — | 节点必填，如 `http://192.168.50.50:8770` |
+
+## 注册与身份（/register · cluster_id + fp · 多地址归一）
+
+`POST /register` body（center schema≥2；旧字段全兼容，旧 center 忽略新字段）：
+
+```json
+{ "node":"macjol", "persona":"coral-marten-10", "machine":"Darwin arm64",
+  "cluster_id":"88c5b1f339488c31", "fp":"a3e9653b6bc2e487" }
+```
+
+- **`cluster_id`** = ZT 网络 id（节点读 `~/.ccp-cluster` 或 env `CLUSTER_ID`）。机群锚,全球唯一+隔离,**不会和别人机群撞名**;center 校 `cluster_match`。
+- **`fp`(节点指纹)** = `sha256(machine-id ⊕ ZT-node-id)[:16]`。
+  - `machine-id`:Linux=`/etc/machine-id`,macOS=`IOPlatformUUID`(ioreg),退化 hostname。
+  - `ZT-node-id`:`zerotier-cli info` 第3字段(或 `identity.public` 首段);无 ZT 退化为 `sha256(machine-id)[:16]`。
+  - `⊕`:两串 ASCII 字节**逐位 XOR,短串循环铺满长串**,再 sha256 取前16 hex。确定性、跨重启/重装稳定、机器维度唯一。
+  - **节点自证、center 不复算**:center 仅存 fp 比对——同名不同 fp = 冒名/换机 → **409 拒、不覆盖**(`conflicts`计数);`fp_src=node-reported`(真报)/`legacy-backfill`(旧节点补)/`weak_fp`(无ZT退化)。
+- **地址不自报**:body 里**不放 addresses**——center 用 **HTTP 连接的源 IP**自采(防伪,自报地址会被忽略)。
+  - **多地址归一台机**:同一节点经不同网段(ZT 10.68.63.x / LAN 192.168.x / 别的段)分别打 center,各次源 IP 被**按 fp 归并到同一节点条目**,`kind` 按子网判(zt/lan)。
+  - 实测:macjol 经 ZT(`10.68.63.93`)+ LAN(`192.168.50.50`)各注册一次 → 同一条目挂 `10.68.63.60(zt)`+`192.168.50.51(lan)`,`conflicts:0`。解决"机器有多地址、center 卡某栏找不到"。
+- **`online`** = 任一地址近 `online_ttl_s`(默120s)有活动(注册/握手/被动收包);一次性 register 不持续握手 → 很快 `stale`。要长亮需 node-agent 持续握手回合。
+
+> LAN **组播自动发现**(beacon→`/discovered`)是「发现未知新节点」的增强,与本注册路径正交;跨 Proxmox 宿主组播会被网桥丢,待桥修(需机主点头)。**ZT/LAN 单播 + /register 不依赖组播,现可用。**

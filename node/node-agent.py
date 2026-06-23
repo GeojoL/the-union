@@ -11,7 +11,7 @@
   HS_INTERVAL=60   HS_DURATION=43200   NODE_HOME=~/machine-nodes-node
 停: touch $NODE_HOME/handshake.stop
 """
-import os, sys, json, time, secrets, socket, urllib.request, urllib.error
+import os, sys, json, time, secrets, socket, hashlib, subprocess, urllib.request, urllib.error
 
 CENTER = os.environ.get("CENTER", "").rstrip("/")
 NODE = os.environ.get("NODE") or socket.gethostname().split(".")[0]
@@ -84,13 +84,91 @@ def do_cycle(seq):
     return True, "OK", rtt
 
 
+def _machine_id():
+    """跨平台机器唯一 id:Linux=/etc/machine-id;macOS=IOPlatformUUID;退化=hostname。"""
+    for p in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            with open(p) as f:
+                v = f.read().strip()
+                if v:
+                    return v
+        except Exception:
+            pass
+    try:
+        out = subprocess.run(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                             capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if "IOPlatformUUID" in line:
+                return line.split('"')[-2]
+    except Exception:
+        pass
+    return socket.gethostname()
+
+
+def _zt_node_id():
+    """ZeroTier 10-hex 节点地址:zerotier-cli info 优先,退化读 identity.public;无 ZT 返回空。"""
+    for cli in ("zerotier-cli", "/usr/local/bin/zerotier-cli",
+                "/opt/homebrew/bin/zerotier-cli", "/usr/sbin/zerotier-cli"):
+        try:
+            parts = subprocess.run([cli, "info"], capture_output=True, text=True, timeout=5).stdout.split()
+            if len(parts) >= 3 and parts[0] == "200":
+                return parts[2]
+        except Exception:
+            pass
+    for p in ("/var/lib/zerotier-one/identity.public",
+              os.path.expanduser("~/Library/Application Support/ZeroTier/One/identity.public"),
+              "/Library/Application Support/ZeroTier/One/identity.public"):
+        try:
+            with open(p) as f:
+                return f.read().split(":", 1)[0].strip()
+        except Exception:
+            pass
+    return ""
+
+
+def node_fp():
+    """节点指纹 = sha256(machine-id ⊕ ZT-node-id)[:16]。⊕=两串字节逐位 XOR,短串循环铺满长串。
+    稳定(跨重启/重装不变)+ 唯一(机器维度)+ 节点自证(center 不可复算,仅存比对、撞 fp 拒)。
+    无 ZT 时退化为 sha256(machine-id)[:16](仍稳定,弱一档由 center 判 weak_fp)。"""
+    mid = _machine_id().encode()
+    zt = _zt_node_id().encode()
+    if not zt:
+        xb = mid
+    else:
+        n = max(len(mid), len(zt))
+        xb = bytes(mid[i % len(mid)] ^ zt[i % len(zt)] for i in range(n))
+    return hashlib.sha256(xb).hexdigest()[:16]
+
+
+def cluster_id():
+    """机群锚 = ZT 网络 id。env CLUSTER_ID 优先,退化读 ~/.ccp-cluster。"""
+    v = os.environ.get("CLUSTER_ID")
+    if v:
+        return v
+    try:
+        with open(os.path.expanduser("~/.ccp-cluster")) as f:
+            for line in f:
+                if line.startswith("cluster_id="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return ""
+
+
 def register():
     try:
         mach = "%s %s" % (os.uname().sysname, os.uname().machine)
     except Exception:
         mach = "?"
+    body = {"node": NODE, "persona": PERSONA, "machine": mach}
+    fp = node_fp(); cid = cluster_id()
+    if fp:
+        body["fp"] = fp
+    if cid:
+        body["cluster_id"] = cid
+    # 地址不自报:center 按 HTTP 连接源 IP 自采(防伪),节点经各网段打 center 即被自动累加归并到同一 fp
     try:
-        post("/register", {"node": NODE, "persona": PERSONA, "machine": mach}, timeout=15)
+        post("/register", body, timeout=15)
         return True
     except Exception as e:
         with open(LOG, "a") as f:
