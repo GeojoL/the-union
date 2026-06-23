@@ -193,12 +193,17 @@ def upsert_addr(entry, ip, source, port=None):
 
 
 def compute_online(entry):
-    """混合判据,被动优先:最近 last_seen<TTL → 在线;否则任一址最近探通 → 在线;否则 stale。绝不因探测失败否决被动在线。"""
+    """混合判据,被动优先 + GeojoLu「任一通即在线」:最近【任一接触】(top-level last_seen 或任一地址 last_seen,
+    含 register/握手)<TTL → 在线;否则任一址最近主动探通 → 在线;否则 stale。绝不因某址不通否决其它址的在线。"""
     now = time.time()
     ls = entry.get("last_seen")
     if ls and now - _epoch(ls) < ONLINE_TTL:
         return True, "recent_seen"
-    for a in entry.get("addresses", []):
+    for a in entry.get("addresses", []):       # 任一地址最近被见(register/握手都刷)= 在线(治刚 register 却显离线)
+        als = a.get("last_seen")
+        if als and now - _epoch(als) < ONLINE_TTL:
+            return True, "recent_seen"
+    for a in entry.get("addresses", []):       # 退而求其次:主动探测探通
         lo = a.get("last_ok")
         if lo and now - _epoch(lo) < ONLINE_TTL:
             return True, "probe_up"
