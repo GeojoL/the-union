@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 # ccp-resolve-id — 解析当前 CCP 身份(B+ 标准,najol 定/Mahaul 实现 macjol 侧;DRY 单点,供 ccp-send/ccp-pull/... 复用)。
-# 规则:① $CCP_ID 已设 → 直接用(显式优先)。
+# 规则:① $CCP_ID 已设 → 用它,但仍【按 roster 规范化大小写】(命中 roster→回 roster 原文 casing;
+#         不命中→显式 override 原样放行,留给测试/未登记身份)。★消除 natty@macjol vs Natty@macjol 大小写分裂。
 #   ② 未设 → 从 tmux 窗口名派生:capitalize(window_name)+'@'+<节点名>。
 #      节点名取 ~/.ccp-node(各机一份,如 macjol);无则回退 hostname -s。★不写死 @macjol,generic 跨机同律。
-#   ③ 派生后【对 roster 校验】(~/.ccp-inbox/roster,本机 known-AI 名单,镜像 AI-PROTOCOL §1)——不在名单→拒。
+#   ③ 派生后【对 roster 校验】(~/.ccp-inbox/roster,本机 known-AI 名单,镜像 AI-PROTOCOL §1)——不在名单(含大小写)→拒。
 #   ④ 拿不到窗口名(无 TMUX_PANE/不在 tmux/名空)或无 roster → 【fail-loud 拒发,exit 非0,绝不回退硬编码身份】=杀冒充核心。
 set -uo pipefail
-if [ -n "${CCP_ID:-}" ]; then printf '%s\n' "$CCP_ID"; exit 0; fi
+ROSTER="$HOME/.ccp-inbox/roster"
+# canon <id>:命中 roster(大小写不敏感)→ 打印 roster 规范原文并 return 0;未命中 return 1。
+canon() { [ -f "$ROSTER" ] || return 1; local m; m="$(grep -ixF "$1" "$ROSTER" | head -1)"; [ -n "$m" ] && { printf '%s\n' "$m"; return 0; }; return 1; }
+
+if [ -n "${CCP_ID:-}" ]; then
+  canon "$CCP_ID" && exit 0          # roster 成员 → 规范大小写(统一 cursor/seen/from,堵大小写分裂)
+  printf '%s\n' "$CCP_ID"; exit 0    # 非 roster(测试/未登记)→ 显式 override 原样放行
+fi
+
 TMUX_BIN="$(command -v tmux || echo /opt/homebrew/bin/tmux)"
 if [ -z "${TMUX_PANE:-}" ]; then
   echo "ccp-resolve-id: CCP_ID 未设且不在 tmux pane(无 TMUX_PANE)→ 拒绝解析(fail-loud,防默认冒充)。请显式 export CCP_ID=<你的身份>。" >&2; exit 3
@@ -17,11 +26,8 @@ first="$(printf '%s' "$wn" | cut -c1 | tr '[:lower:]' '[:upper:]')"
 rest="$(printf '%s' "$wn" | cut -c2-)"
 node="$(tr -d '[:space:]' < "$HOME/.ccp-node" 2>/dev/null || true)"; [ -n "$node" ] || node="$(hostname -s)"
 id="${first}${rest}@${node}"
-roster="$HOME/.ccp-inbox/roster"
-if [ ! -f "$roster" ]; then
-  echo "ccp-resolve-id: 无 roster 名单 $roster,无法校验派生身份 '$id' → 拒绝(fail-loud)。" >&2; exit 4
+if [ ! -f "$ROSTER" ]; then
+  echo "ccp-resolve-id: 无 roster 名单 $ROSTER,无法校验派生身份 '$id' → 拒绝(fail-loud)。" >&2; exit 4
 fi
-if ! grep -qx "$id" "$roster"; then
-  echo "ccp-resolve-id: 派生身份 '$id' 不在 roster 名单($roster)→ 拒绝(防 typo/未改名窗口冒充)。" >&2; exit 4
-fi
-printf '%s\n' "$id"
+canon "$id" && exit 0                 # 命中即回规范 casing
+echo "ccp-resolve-id: 派生身份 '$id' 不在 roster 名单($ROSTER)→ 拒绝(防 typo/未改名窗口冒充)。" >&2; exit 4
