@@ -58,24 +58,111 @@ machine-nodes 的健康验证**不看心跳**，看**读确认挑战-应答**：
 | `HS_DURATION` | 43200 | 总时长（秒，12h）|
 | `CENTER` | — | 节点必填，如 `http://192.168.50.50:8770` |
 
-## 注册与身份（/register · cluster_id + fp · 多地址归一）
+---
 
-`POST /register` body（center schema≥2；旧字段全兼容，旧 center 忽略新字段）：
+# The Union — 机群身份 / 节点表 / LAN 自动发现 / 一机多址（center 侧,2026-06-23）
+
+> 握手协议（上）不变。本节是 center 在握手之上新增的【机群治理 + union-tui 数据契约】。
+
+## 机群身份（cluster identity）
+
+机群锚 = **ZeroTier 网络 nwid**（全球唯一 + 网络隔离 → 撞名结构上不可能）。本机群 = `88c5b1f339488c31`（"GeojoLu's Nodes"）。
+
+- **center 自动锚定**：启动按 `env CENTER_CLUSTER_ID` > 本机唯一 ZT nwid（`/var/lib/zerotier-one/networks.d/*.conf`，零 sudo 可读）> 默认 `88c5b1f339488c31`。
+- **节点名唯一性**：用 node 自报稳定指纹 `fp`（可选,建议 `sha256(machine-id ⊕ ZT-node-id)[:16]`）。同名同 fp = 同机刷新；**同名不同 fp = 撞名拒 409,不覆盖旧机**（保护既有节点）。fp 缺省 = `weak_fp`,宽松同名（向后兼容旧 installer）。
+- **registry 信封**：顶层保留键 `_meta = {cluster_id, cluster_name, center_node, schema, updated}`；遍历节点跳过 `_` 前缀键。每节点条目 backfill `cluster_id/fp/fp_src/conflicts/source/addresses`。迁移惰性、幂等。
+
+## 一机多址 + 在线判定
+
+一台机器可有多地址（ZT `10.68.63.x` + 各 LAN 段）。center 按 **node 名归并** `addresses[]`，**在线判定被动优先**：
+
+- `online = (now - last_seen < ONLINE_TTL[默认120s])`，用**不可伪造的 TCP 源 IP**（`self.client_address`,握手/注册时自动采集）。
+- 任一地址最近主动探通 → 也算在线（主动 TCP 探测默认关 `PROBE_ENABLE=0`,避免 center→node 扫内网；多数 node 不监听端口）。
+- **绝不因某地址探测失败否决被动在线**（治"卡 ZT 栏找不到某机"：ZT 那条 stale 但 LAN 条 recent → 整机 online）。
+
+## HTTP 端点（向后兼容,只增不删）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/cluster` | **机群权威视图 = union-tui center 数据源**。见下 schema |
+| GET | `/discovered` | LAN 组播发现的【未受信】节点(待人工 confirm) |
+| POST | `/discovered/confirm` `{node}` | 人工把某 discovered 升 registered（**唯一授信路径**） |
+| POST | `/discovered/reject` `{node}` | 移除 discovered + 短期抑制 |
+| POST | `/register` | 增可选 `cluster_id`/`fp`/`addrs`/`port`；cluster_id 不匹配→409,fp 撞名→409 |
+| GET | `/hs/status` | 兼容旧形状（过滤 `_meta`,只回节点条目） |
+
+### `GET /cluster` 契约（Rust serde 映射用）
 
 ```json
-{ "node":"macjol", "persona":"coral-marten-10", "machine":"Darwin arm64",
-  "cluster_id":"88c5b1f339488c31", "fp":"a3e9653b6bc2e487" }
+{
+  "cluster_id": "88c5b1f339488c31",
+  "cluster_name": "GeojoLu's Nodes",
+  "center_node": "aeb5d1aa97",
+  "center": { "zt_ip": "10.68.63.93", "lan_ip": "192.168.50.50" },
+  "schema": 2,
+  "ts": "2026-06-23T10:19:39",
+  "online_ttl_s": 120,
+  "node_count": 1,
+  "discovered_count": 0,
+  "nodes": {
+    "rasjol": {
+      "node": "rasjol", "persona": "jade-wren-c0", "machine": "Linux aarch64",
+      "ok": 3515, "fail": 0, "last_seen": "...", "last_rtt_ms": 12,
+      "cluster_id": "88c5b1f339488c31", "fp": "", "fp_src": "legacy-backfill",
+      "weak_fp": true, "cluster_match": true, "conflicts": 0, "source": "register",
+      "online": true, "online_reason": "recent_seen",
+      "addresses": [
+        { "addr": "192.168.50.126", "kind": "lan", "port": null,
+          "source": "handshake", "first_seen": "...", "last_seen": "...",
+          "last_ok": null, "probe_state": "unknown" }
+      ]
+    }
+  }
+}
 ```
 
-- **`cluster_id`** = ZT 网络 id（节点读 `~/.ccp-cluster` 或 env `CLUSTER_ID`）。机群锚,全球唯一+隔离,**不会和别人机群撞名**;center 校 `cluster_match`。
-- **`fp`(节点指纹)** = `sha256(machine-id ⊕ ZT-node-id)[:16]`。
-  - `machine-id`:Linux=`/etc/machine-id`,macOS=`IOPlatformUUID`(ioreg),退化 hostname。
-  - `ZT-node-id`:`zerotier-cli info` 第3字段(或 `identity.public` 首段);无 ZT 退化为 `sha256(machine-id)[:16]`。
-  - `⊕`:两串 ASCII 字节**逐位 XOR,短串循环铺满长串**,再 sha256 取前16 hex。确定性、跨重启/重装稳定、机器维度唯一。
-  - **节点自证、center 不复算**:center 仅存 fp 比对——同名不同 fp = 冒名/换机 → **409 拒、不覆盖**(`conflicts`计数);`fp_src=node-reported`(真报)/`legacy-backfill`(旧节点补)/`weak_fp`(无ZT退化)。
-- **地址不自报**:body 里**不放 addresses**——center 用 **HTTP 连接的源 IP**自采(防伪,自报地址会被忽略)。
-  - **多地址归一台机**:同一节点经不同网段(ZT 10.68.63.x / LAN 192.168.x / 别的段)分别打 center,各次源 IP 被**按 fp 归并到同一节点条目**,`kind` 按子网判(zt/lan)。
-  - 实测:macjol 经 ZT(`10.68.63.93`)+ LAN(`192.168.50.50`)各注册一次 → 同一条目挂 `10.68.63.60(zt)`+`192.168.50.51(lan)`,`conflicts:0`。解决"机器有多地址、center 卡某栏找不到"。
-- **`online`** = 任一地址近 `online_ttl_s`(默120s)有活动(注册/握手/被动收包);一次性 register 不持续握手 → 很快 `stale`。要长亮需 node-agent 持续握手回合。
+`online_reason ∈ {recent_seen, probe_up, stale}`；`addresses[].kind ∈ {zt, lan, other}`；`addresses[].probe_state ∈ {up, down, unknown}`。
 
-> LAN **组播自动发现**(beacon→`/discovered`)是「发现未知新节点」的增强,与本注册路径正交;跨 Proxmox 宿主组播会被网桥丢,待桥修(需机主点头)。**ZT/LAN 单播 + /register 不依赖组播,现可用。**
+### `GET /discovered` 契约
+
+```json
+{ "cluster_id": "88c5b1f339488c31", "count": 1,
+  "nodes": [ { "node": "lannode1", "cluster_id": "...", "role": "node",
+    "addr": "192.168.50.99", "src_addr": "192.168.50.50", "port": 9999,
+    "first_seen": "...", "last_seen": "...", "count": 3, "status": "discovered",
+    "addr_matches_src": false } ] }
+```
+
+`addr_matches_src=false` = 信标自报 addr 与 UDP 真实源 IP 不符（可疑,人工 confirm 时判断）。
+
+## LAN 组播自动发现
+
+- node/installer 周期（~15s）UDP 组播信标到 `239.255.63.70:48770`：`{cluster_id, node, role, addr, port}`。
+- center 后台 daemon 监听，**只收 cluster_id 匹配本机群**的信标 → 登记 `discovered`（纯内存、有界 64 + TTL 120s）。
+- **LAN 无鉴权 → 绝不自动信任**：discovered 永远只是线索,必须人工 `POST /discovered/confirm` 才进 registry。
+- ⚠️ **LXC/Proxmox 组播可达性**：CT110 在 vmbr 桥后,跨宿主 LAN 节点的组播能否到达 center 需运维验证（IGMP snooping / 桥转发）；不通时 ZT 手配 + `/register` 仍是兜底（发现是【增强】非替代）。
+
+## 安全边界
+
+- `:8770` 绑 `0.0.0.0`、LAN+ZT 可达、**无鉴权**。cluster_id 是公开 nwid,只防误连/串扰,**不是鉴权凭据**（真隔离靠 ZT 入网 + guardian 防火墙 + 人工 confirm）。
+- node 名 / seq 白名单（`NODE_RE`/`SEQ_RE`,挡路径穿越）；challenge/rtt clamp；DoS 有界（`MAX_NODES/MAX_BODY/MAX_DISCOVERED/MAX_ADDRS/MAX_BEACON`）。
+- systemd 沙箱：`ProtectSystem=strict` + `ReadWritePaths=CENTER_HOME` + `ProtectHome=read-only` + `NoNewPrivileges`（即使再出路径 bug 也写不出 CENTER_HOME）。
+
+## center 侧 env（全可覆盖,零依赖）
+
+| env | 默认 | 说明 |
+|-----|------|------|
+| `CENTER_CLUSTER_ID` | 自动检测 | 机群 ZT nwid |
+| `CENTER_MCAST_GRP` / `CENTER_MCAST_PORT` | `239.255.63.70` / `48770` | 组播组 |
+| `CENTER_DISCOVERY` | `1` | LAN 发现开关 |
+| `ONLINE_TTL_S` | `120` | 被动在线阈值 |
+| `PROBE_ENABLE` / `PROBE_PORTS` | `0` / `8770,22` | 主动探测(默认关) |
+| `MAX_NODES` / `MAX_DISCOVERED` / `MAX_ADDRS` | `64` / `64` / `16` | 有界 |
+
+## 节点侧实测确认（macjol，2026-06-23）
+
+node-agent.py 已落地 `cluster_id + fp` 注册（`fp = sha256(machine-id ⊕ ZT-node-id)[:16]`，跨平台 mac/linux）。center↔node 端到端实测通过：
+
+- macjol 注册 → `fp=a3e9653b6bc2e487, fp_src=node-reported, weak_fp=false, cluster_match=true` = 全机群首个真实 node-reported fp。
+- **多地址归一台机**：macjol 经 ZT(`10.68.63.93`)+ LAN(`192.168.50.50`)各 `/register` 一次 → center 按连接源 IP 归并到同一条目（`10.68.63.60` zt + `192.168.50.51` lan，`conflicts:0`）。验证「源 IP 防伪 + 一机多址识别成一台」成立。
+- 地址**不自报**（body 不放 addresses，center 用源 IP 自采，自报忽略）。
