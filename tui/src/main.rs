@@ -319,8 +319,52 @@ fn suspend_run(cmd: &str, args: &[&str], reinit: bool) -> Option<ratatui::Defaul
     if reinit { Some(ratatui::init()) } else { None }
 }
 
+// 多地址自收集(跨平台,不 shell ifconfig):枚举本机非 loopback IPv4。
+fn collect_addrs() -> Vec<String> {
+    let mut v = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for i in ifaces {
+            if i.is_loopback() { continue; }
+            let ip = i.ip();
+            if ip.is_ipv4() { v.push(ip.to_string()); }
+        }
+    }
+    v.sort(); v.dedup(); v
+}
+
+// LAN 组播信标:广播 {cluster_id,node,role,addrs[],port,ts} → center 监听自动发现(只收同 cluster_id)。
+fn beacon(once: bool) -> io::Result<()> {
+    use std::net::UdpSocket;
+    let (group, port) = ("239.255.63.70", 48770u16);
+    let cluster = read_kv(".ccp-cluster", "cluster_id");
+    let node = node_name();
+    let role = { let r = read_kv(".ccp-center", "role"); if r == "center" { "center" } else { "node" } };
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    sock.set_multicast_ttl_v4(1).ok();
+    let dest = format!("{}:{}", group, port);
+    loop {
+        let addrs = collect_addrs();
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let payload = serde_json::json!({
+            "cluster_id": cluster, "node": node, "role": role, "addrs": addrs, "port": port, "ts": ts
+        }).to_string();
+        let sent = sock.send_to(payload.as_bytes(), &dest);
+        if once { println!("beacon → {} : {}\n(发送结果: {:?})", dest, payload, sent.map(|n| format!("{}B", n))); return Ok(()); }
+        std::thread::sleep(Duration::from_secs(15));
+    }
+}
+
 fn main() -> io::Result<()> {
-    if std::env::args().any(|a| a == "--dump") { dump(); return Ok(()); }
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("--dump") => { dump(); return Ok(()); }
+        Some("beacon") => { return beacon(args.iter().any(|a| a == "--once")); }
+        Some("-h") | Some("--help") => {
+            println!("union-tui [tui|beacon|--dump]\n  (无参/tui)交互控制台  beacon[ --once]LAN信标  --dump无头自检");
+            return Ok(());
+        }
+        _ => {}
+    }
     ensure_center_config();
     let mut terminal = ratatui::init();
     let mut app = App::new();
