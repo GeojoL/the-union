@@ -113,35 +113,144 @@ fn read_services() -> Vec<Service> {
     }).collect()
 }
 
+// ---- center HTTP(极简 TcpStream 客户端,不引重依赖,守单二进制跨平台)----
+fn center_base() -> String {
+    let c = read_kv(".ccp-center", "center");
+    if c.is_empty() { "http://10.68.63.93:8770".into() } else { c.trim_end_matches('/').to_string() }
+}
+fn parse_url(url: &str) -> Option<(String, u16, String)> {
+    let rest = url.strip_prefix("http://")?;
+    let (hp, path) = match rest.find('/') { Some(i) => (&rest[..i], &rest[i..]), None => (rest, "/") };
+    let (host, port) = match hp.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(80)), None => (hp.to_string(), 80) };
+    Some((host, port, path.to_string()))
+}
+fn http_req(method: &str, url: &str, body: Option<&str>) -> io::Result<String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    let (host, port, path) = parse_url(url).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad url"))?;
+    let mut s = TcpStream::connect((host.as_str(), port))?;
+    s.set_read_timeout(Some(Duration::from_secs(4))).ok();
+    s.set_write_timeout(Some(Duration::from_secs(4))).ok();
+    let b = body.unwrap_or("");
+    let req = format!("{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+        method, path, host, b.len(), b);
+    s.write_all(req.as_bytes())?;
+    let mut raw = String::new();
+    s.read_to_string(&mut raw)?;
+    Ok(raw.splitn(2, "\r\n\r\n").nth(1).unwrap_or("").to_string())
+}
+fn http_get(url: &str) -> io::Result<String> { http_req("GET", url, None) }
+fn http_post(url: &str, body: &str) -> io::Result<String> { http_req("POST", url, Some(body)) }
+
+#[derive(Clone, Default)]
+struct Addr { addr: String, kind: String, source: String, probe: String }
+#[derive(Clone, Default)]
+struct Node {
+    name: String, persona: String, machine: String, online: bool, online_reason: String,
+    fp: String, weak_fp: bool, conflicts: i64, cluster_match: bool, last_seen: String, rtt: i64, addrs: Vec<Addr>,
+}
+#[derive(Clone, Default)]
+struct Discovered { node: String, addr: String, src_addr: String, addr_matches_src: bool, count: i64 }
+struct Cluster { cluster_id: String, name: String, schema: i64, online_ttl: i64, nodes: Vec<Node>, err: String }
+
+fn jstr(v: &serde_json::Value, k: &str) -> String { v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string() }
+fn jbool(v: &serde_json::Value, k: &str) -> bool { v.get(k).and_then(|x| x.as_bool()).unwrap_or(false) }
+fn jint(v: &serde_json::Value, k: &str) -> i64 { v.get(k).and_then(|x| x.as_i64()).unwrap_or(0) }
+
+fn fetch_cluster() -> Cluster {
+    let url = format!("{}/cluster", center_base());
+    let mut c = Cluster { cluster_id: String::new(), name: String::new(), schema: 0, online_ttl: 0, nodes: vec![], err: String::new() };
+    match http_get(&url) {
+        Err(e) => c.err = format!("连不上 center {}: {}", url, e),
+        Ok(txt) => match serde_json::from_str::<serde_json::Value>(&txt) {
+            Err(e) => c.err = format!("解析失败: {} (原文 {}B)", e, txt.len()),
+            Ok(v) => {
+                c.cluster_id = jstr(&v, "cluster_id"); c.name = jstr(&v, "cluster_name");
+                c.schema = jint(&v, "schema"); c.online_ttl = jint(&v, "online_ttl_s");
+                if let Some(nodes) = v.get("nodes").and_then(|x| x.as_object()) {
+                    for (k, nv) in nodes {
+                        let mut n = Node {
+                            name: { let s = jstr(nv, "node"); if s.is_empty() { k.clone() } else { s } },
+                            persona: jstr(nv, "persona"), machine: jstr(nv, "machine"),
+                            online: jbool(nv, "online"), online_reason: jstr(nv, "online_reason"),
+                            fp: jstr(nv, "fp"), weak_fp: jbool(nv, "weak_fp"), conflicts: jint(nv, "conflicts"),
+                            cluster_match: jbool(nv, "cluster_match"), last_seen: jstr(nv, "last_seen"),
+                            rtt: jint(nv, "last_rtt_ms"), addrs: vec![],
+                        };
+                        if let Some(arr) = nv.get("addresses").and_then(|x| x.as_array()) {
+                            for a in arr { n.addrs.push(Addr { addr: jstr(a, "addr"), kind: jstr(a, "kind"), source: jstr(a, "source"), probe: jstr(a, "probe_state") }); }
+                        }
+                        c.nodes.push(n);
+                    }
+                    c.nodes.sort_by(|a, b| a.name.cmp(&b.name));
+                }
+            }
+        },
+    }
+    c
+}
+fn fetch_discovered() -> Vec<Discovered> {
+    let url = format!("{}/discovered", center_base());
+    let mut out = vec![];
+    if let Ok(txt) = http_get(&url) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) {
+            if let Some(arr) = v.get("nodes").and_then(|x| x.as_array()) {
+                for d in arr { out.push(Discovered { node: jstr(d, "node"), addr: jstr(d, "addr"), src_addr: jstr(d, "src_addr"), addr_matches_src: jbool(d, "addr_matches_src"), count: jint(d, "count") }); }
+            }
+        }
+    }
+    out
+}
+// confirm/reject:授信路径,打 center POST /discovered/{confirm,reject}
+fn discovered_action(act: &str, node: &str) -> io::Result<String> {
+    http_post(&format!("{}/discovered/{}", center_base(), act), &format!("{{\"node\":\"{}\"}}", node))
+}
+
 #[derive(PartialEq, Clone, Copy)]
-enum Tab { Messages, Personas, Services, Settings }
+enum Tab { Messages, Personas, Services, Cluster, Settings }
 
 struct App {
     tab: Tab,
     msgs: Vec<Msg>,
     personas: Vec<Persona>,
     services: Vec<Service>,
+    cluster: Cluster,
+    discovered: Vec<Discovered>,
     msg_state: ListState,
     persona_state: ListState,
     service_state: ListState,
+    node_state: ListState,
+    disc_state: ListState,
     only_to_me: bool,
     follow: bool,
     status: String,
     quit: bool,
     last_refresh: Instant,
+    last_cluster: Instant,
 }
 impl App {
     fn new() -> Self {
         let mut a = App {
             tab: Tab::Messages, msgs: read_bus(), personas: read_personas(), services: read_services(),
+            cluster: Cluster { cluster_id: String::new(), name: String::new(), schema: 0, online_ttl: 0, nodes: vec![], err: "(进 Cluster 标签或按 r 拉取)".into() },
+            discovered: vec![],
             msg_state: ListState::default(), persona_state: ListState::default(), service_state: ListState::default(),
-            only_to_me: false, follow: true, status: String::new(), quit: false, last_refresh: Instant::now(),
+            node_state: ListState::default(), disc_state: ListState::default(),
+            only_to_me: false, follow: true, status: String::new(), quit: false, last_refresh: Instant::now(), last_cluster: Instant::now(),
         };
         let n = a.filtered_msgs().len();
         if n > 0 { a.msg_state.select(Some(n - 1)); }
         if !a.personas.is_empty() { a.persona_state.select(Some(0)); }
         if !a.services.is_empty() { a.service_state.select(Some(0)); }
         a
+    }
+    fn refresh_cluster(&mut self) {
+        self.cluster = fetch_cluster();
+        self.discovered = fetch_discovered();
+        if !self.cluster.nodes.is_empty() && self.node_state.selected().is_none() { self.node_state.select(Some(0)); }
+        if !self.discovered.is_empty() && self.disc_state.selected().is_none() { self.disc_state.select(Some(0)); }
+        self.last_cluster = Instant::now();
     }
     fn me(&self) -> String { format!("Mahaul@{}", node_name()) }
     fn filtered_msgs(&self) -> Vec<Msg> {
@@ -167,6 +276,7 @@ impl App {
             Tab::Messages => { let n = self.filtered_msgs().len(); step(&mut self.msg_state, n, 1); }
             Tab::Personas => step(&mut self.persona_state, self.personas.len(), 1),
             Tab::Services => step(&mut self.service_state, self.services.len(), 1),
+            Tab::Cluster => step(&mut self.node_state, self.cluster.nodes.len(), 1),
             Tab::Settings => {}
         }
     }
@@ -175,6 +285,7 @@ impl App {
             Tab::Messages => { let n = self.filtered_msgs().len(); step(&mut self.msg_state, n, -1); }
             Tab::Personas => step(&mut self.persona_state, self.personas.len(), -1),
             Tab::Services => step(&mut self.service_state, self.services.len(), -1),
+            Tab::Cluster => step(&mut self.node_state, self.cluster.nodes.len(), -1),
             Tab::Settings => {}
         }
     }
@@ -210,14 +321,29 @@ fn dump() {
     for s in &services {
         println!("  {} loaded={} pid={} lastExit={} | {}", s.label, s.loaded, if s.pid.is_empty(){"-"}else{&s.pid}, if s.last_exit.is_empty(){"-"}else{&s.last_exit}, s.desc);
     }
+    // center 模式数据(实拉 /cluster + /discovered)
+    let cl = fetch_cluster(); let disc = fetch_discovered();
+    if cl.err.is_empty() {
+        println!("\n[机群·center {}] cluster_id={} name={} schema={} 节点 {}:", center_base(), cl.cluster_id, cl.name, cl.schema, cl.nodes.len());
+        for n in &cl.nodes {
+            let a: Vec<String> = n.addrs.iter().map(|x| format!("{}({})", x.addr, x.kind)).collect();
+            println!("  {} {} [{}] fp={}{} conflicts={} addrs=[{}]",
+                if n.online {"●"} else {"○"}, n.name, n.online_reason, short(&n.fp,12),
+                if n.weak_fp {" weak"} else {""}, n.conflicts, a.join(","));
+        }
+        println!("[发现待确认] {}:", disc.len());
+        for d in &disc { println!("  {} {} src{} x{}", d.node, d.addr, if d.addr_matches_src {"✓"} else {"✗"}, d.count); }
+    } else {
+        println!("\n[机群·center {}] 拉取失败: {}", center_base(), cl.err);
+    }
 }
 
 fn short(s: &str, n: usize) -> String { if s.chars().count() > n { s.chars().take(n).collect() } else { s.to_string() } }
 
 fn ui(f: &mut Frame, app: &mut App) {
     let c = Layout::vertical([Constraint::Length(3), Constraint::Min(0), Constraint::Length(1)]).split(f.area());
-    let titles = vec!["Messages", "Personas", "Services", "Settings"];
-    let sel = match app.tab { Tab::Messages=>0, Tab::Personas=>1, Tab::Services=>2, Tab::Settings=>3 };
+    let titles = vec!["Messages", "Personas", "Services", "Cluster", "Settings"];
+    let sel = match app.tab { Tab::Messages=>0, Tab::Personas=>1, Tab::Services=>2, Tab::Cluster=>3, Tab::Settings=>4 };
     f.render_widget(
         Tabs::new(titles).select(sel)
             .block(Block::default().borders(Borders::ALL).title(format!(" The Union · {} · {} ", node_name(), read_kv(".ccp-cluster","cluster_name"))))
@@ -227,12 +353,14 @@ fn ui(f: &mut Frame, app: &mut App) {
         Tab::Messages => render_messages(f, app, c[1]),
         Tab::Personas => render_personas(f, app, c[1]),
         Tab::Services => render_services(f, app, c[1]),
+        Tab::Cluster => render_cluster(f, app, c[1]),
         Tab::Settings => render_settings(f, app, c[1]),
     }
     let help = match app.tab {
         Tab::Messages => " q退出 Tab切 ↑↓滚 f仅发我的 r刷新 (live自动刷新) ",
         Tab::Personas => " q退出 Tab切 ↑↓选 e用$EDITOR编辑人格 r刷新 ",
         Tab::Services => " q退出 Tab切 ↑↓选 k立即跑(kickstart) u跑版本升级 r刷新 ",
+        Tab::Cluster => " q退出 Tab切 ↑↓选节点 c确认发现 x拒绝发现 r刷新(每10s自动) ",
         Tab::Settings => " q退出 Tab切 e编辑中心地址(~/.ccp-center,手填) r刷新 ",
     };
     let st = if app.status.is_empty() { help.to_string() } else { format!("{} | {}", help, app.status) };
@@ -295,6 +423,56 @@ fn render_services(f: &mut Frame, app: &mut App, area: Rect) {
             .title(" 服务(k=立即跑 kickstart / u=跑版本升级 agent-update) "))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
         area, &mut app.service_state);
+}
+
+fn render_cluster(f: &mut Frame, app: &mut App, area: Rect) {
+    let disc_h = (app.discovered.len() as u16 + 3).clamp(3, 9);
+    let rows = Layout::vertical([Constraint::Min(0), Constraint::Length(disc_h)]).split(area);
+    let cols = Layout::horizontal([Constraint::Percentage(52), Constraint::Percentage(48)]).split(rows[0]);
+    // 节点表
+    let items: Vec<ListItem> = app.cluster.nodes.iter().map(|n| {
+        let (mark, color) = if n.online { ("●", Color::Green) } else { ("○", Color::DarkGray) };
+        let mut z = false; let mut l = false;
+        for a in &n.addrs { if a.kind == "zt" { z = true } else if a.kind == "lan" { l = true } }
+        let kinds = format!("{}{}", if z {"ZT"} else {"  "}, if l {"/LAN"} else {""});
+        ListItem::new(Line::from(vec![
+            Span::styled(format!("{} ", mark), Style::default().fg(color)),
+            Span::styled(format!("{:<10}", short(&n.name, 10)), Style::default().fg(Color::Cyan)),
+            Span::raw(format!("{:<12}", short(&n.online_reason, 12))),
+            Span::styled(format!("{:<6}", kinds), Style::default().fg(Color::Blue)),
+            Span::styled(if n.conflicts > 0 { format!("⚠{}", n.conflicts) } else { String::new() }, Style::default().fg(Color::Red)),
+        ]))
+    }).collect();
+    let title = if app.cluster.err.is_empty() {
+        format!(" 节点 {} · {} · schema{} ", app.cluster.nodes.len(), short(&app.cluster.name, 16), app.cluster.schema)
+    } else { " 节点(未拉到/出错,见详情) ".to_string() };
+    f.render_stateful_widget(List::new(items).block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED)), cols[0], &mut app.node_state);
+    // 详情
+    let detail = if !app.cluster.err.is_empty() && app.cluster.nodes.is_empty() {
+        format!("center: {}\ncluster_id: {}\n\n{}", center_base(), app.cluster.cluster_id, app.cluster.err)
+    } else {
+        app.node_state.selected().and_then(|i| app.cluster.nodes.get(i)).map(|n| {
+            let addrs = if n.addrs.is_empty() { "  (无)".to_string() } else {
+                n.addrs.iter().map(|a| format!("  {} [{}] src={} probe={}", a.addr, a.kind, a.source, a.probe)).collect::<Vec<_>>().join("\n") };
+            format!("节点: {}\n身份: {}\n机型: {}\n在线: {} ({})\nfp: {}{}\ncluster_match: {}   conflicts: {}\nlast_seen: {}   rtt: {}ms\n\n地址:\n{}",
+                n.name, n.persona, n.machine, if n.online {"●在线"} else {"○离线"}, n.online_reason,
+                short(&n.fp, 16), if n.weak_fp {" (weak_fp)"} else {""}, n.cluster_match, n.conflicts, n.last_seen, n.rtt, addrs)
+        }).unwrap_or_else(|| "(无节点)".into())
+    };
+    f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title(format!(" 详情 (center {}) ", center_base()))), cols[1]);
+    // LAN 发现待确认
+    let ditems: Vec<ListItem> = app.discovered.iter().map(|d| ListItem::new(Line::from(vec![
+        Span::styled(format!("{:<10}", short(&d.node, 10)), Style::default().fg(Color::Yellow)),
+        Span::raw(format!("{:<16}", short(&d.addr, 16))),
+        Span::styled(if d.addr_matches_src { "src✓".to_string() } else { format!("src✗({})", d.src_addr) },
+            Style::default().fg(if d.addr_matches_src { Color::Green } else { Color::Red })),
+        Span::raw(format!(" x{}", d.count)),
+    ]))).collect();
+    f.render_stateful_widget(List::new(ditems).block(Block::default().borders(Borders::ALL)
+        .title(format!(" LAN 发现待确认 {} (c确认入群 / x拒绝) ", app.discovered.len())))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED)), rows[1], &mut app.disc_state);
 }
 
 fn render_settings(f: &mut Frame, app: &App, area: Rect) {
@@ -372,14 +550,19 @@ fn main() -> io::Result<()> {
         terminal.draw(|f| ui(f, &mut app))?;
         // live 刷新:每 ~3s 重读总线(低 CPU)
         if app.last_refresh.elapsed() >= Duration::from_secs(3) { app.refresh_bus(); }
+        if app.tab == Tab::Cluster && app.last_cluster.elapsed() >= Duration::from_secs(10) { app.refresh_cluster(); }
         if event::poll(Duration::from_millis(500))? {
             if let Event::Key(k) = event::read()? {
                 if k.kind != KeyEventKind::Press { continue; }
                 app.status.clear();
                 match k.code {
                     KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
-                    KeyCode::Tab => app.tab = match app.tab {
-                        Tab::Messages=>Tab::Personas, Tab::Personas=>Tab::Services, Tab::Services=>Tab::Settings, Tab::Settings=>Tab::Messages },
+                    KeyCode::Tab => {
+                        app.tab = match app.tab {
+                            Tab::Messages=>Tab::Personas, Tab::Personas=>Tab::Services, Tab::Services=>Tab::Cluster,
+                            Tab::Cluster=>Tab::Settings, Tab::Settings=>Tab::Messages };
+                        if app.tab == Tab::Cluster && app.cluster.nodes.is_empty() { app.refresh_cluster(); }
+                    }
                     KeyCode::Down | KeyCode::Char('j') => app.next(),
                     KeyCode::Up | KeyCode::Char('k') if app.tab != Tab::Services => app.prev(),
                     KeyCode::Char('f') if app.tab == Tab::Messages => {
@@ -387,7 +570,26 @@ fn main() -> io::Result<()> {
                         let n = app.filtered_msgs().len();
                         app.msg_state.select(if n > 0 { Some(n-1) } else { None });
                     }
+                    KeyCode::Char('r') if app.tab == Tab::Cluster => { app.refresh_cluster(); app.status = "已拉取 /cluster + /discovered".into(); }
                     KeyCode::Char('r') => app.reload_all(),
+                    KeyCode::Char('c') if app.tab == Tab::Cluster => {
+                        if let Some(d) = app.disc_state.selected().and_then(|i| app.discovered.get(i)).cloned() {
+                            match discovered_action("confirm", &d.node) {
+                                Ok(_) => app.status = format!("已确认 {} 入群", d.node),
+                                Err(e) => app.status = format!("确认失败: {}", e),
+                            }
+                            app.refresh_cluster();
+                        } else { app.status = "无待确认节点".into(); }
+                    }
+                    KeyCode::Char('x') if app.tab == Tab::Cluster => {
+                        if let Some(d) = app.disc_state.selected().and_then(|i| app.discovered.get(i)).cloned() {
+                            match discovered_action("reject", &d.node) {
+                                Ok(_) => app.status = format!("已拒绝 {}", d.node),
+                                Err(e) => app.status = format!("拒绝失败: {}", e),
+                            }
+                            app.refresh_cluster();
+                        } else { app.status = "无待确认节点".into(); }
+                    }
                     KeyCode::Up if app.tab == Tab::Services => app.prev(),
                     KeyCode::Char('e') if app.tab == Tab::Personas => {
                         if let Some(p) = app.persona_state.selected().and_then(|i| app.personas.get(i)) {
